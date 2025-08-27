@@ -19,7 +19,7 @@
     "cesium"
   ],
   "dependencies": {
-    "magic-string": "^0.25.3",
+    "magic-string": "^0.30.17",
     "rollup-pluginutils": "^2.8.2"
   }
 }
