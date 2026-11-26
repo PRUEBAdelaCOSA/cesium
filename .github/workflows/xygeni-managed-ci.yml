@@ -1,0 +1,157 @@
+name: Xygeni Managed CI
+
+on:
+  # Configured in Xygeni (Managed CI). "Scan now" can override the scanners for one run.
+  workflow_dispatch:
+    inputs:
+      scanners:
+        description: Scanners (comma-separated)
+        required: false
+        default: 'secrets,sast,deps,iac,misconf,malware,codetamper,apisec,ai,quality,compliance,inventory,suspectdeps'
+  # no pull request triggers
+  # no schedule triggers
+
+# the scan reads the code and, when pull requests are not blocked, comments on them
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  xygeni-scan:
+    name: Xygeni Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 #v5.2.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # The token stays out of .git/config: the scan needs no git credentials. The whole history is fetched: a pull
+      # request build compares its changes with the target branch.
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ''
+
+      - name: xygeni-scan
+        env:
+          # XYGENI_MANAGED_CI_TOKEN and XYGENI_MANAGED_CI_URL: secrets of this repository, written by Xygeni
+          XYGENI_TOKEN: ${{ secrets.XYGENI_MANAGED_CI_TOKEN }}
+          XYGENI_URL: ${{ secrets.XYGENI_MANAGED_CI_URL }}
+          XYGENI_SCANNERS: ${{ github.event.inputs.scanners || 'secrets,sast,deps,iac,misconf,malware,codetamper,apisec,ai,quality,compliance,inventory,suspectdeps' }}
+          XYGENI_FAIL_ON: 'none'
+          XYGENI_INCREMENTAL: 'false'
+          XYGENI_PULL_REQUEST: ${{ github.event_name == 'pull_request' }}
+          XYGENI_PULL_REQUEST_SOURCE: ${{ github.head_ref }}
+          XYGENI_PULL_REQUEST_BASE: ${{ github.event.pull_request.base.sha }}
+          XYGENI_BUILD_REF: ${{ github.ref }}
+          XYGENI_PIPELINE_PATH: .github/workflows/xygeni-managed-ci.yml
+          XYGENI_SOURCE_DIR: ${{ github.workspace }}
+          XYGENI_MANAGED_CI_RUN_ID: ${{ github.run_id }}
+          XYGENI_MANAGED_CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          XYGENI_MANAGED_CI_TRIGGER: ${{ github.event_name }}
+          XYGENI_MANAGED_CI_PULL_REQUEST: ${{ github.event.pull_request.number }}
+          XYGENI_MANAGED_CI_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          # report-only pull request comment (--pr-comment), with the run's own token
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Xygeni's own setup pull request (branch xygeni-managed-ci-setup-*) that changes only this file is validated
+          # report-only: the check it introduces must not block its own merge. Any other change keeps the check.
+          case "$XYGENI_PULL_REQUEST_SOURCE" in
+            xygeni-managed-ci-setup-*)
+              CHANGED=`git -C "$XYGENI_SOURCE_DIR" diff --name-only "$XYGENI_PULL_REQUEST_BASE"...HEAD 2>/dev/null || true`
+              if [ -n "$XYGENI_PULL_REQUEST_BASE" ] && [ "$CHANGED" = "$XYGENI_PIPELINE_PATH" ]; then
+                echo "Xygeni Managed CI setup pull request: only the workflow file changes, so this validation is report-only"
+                XYGENI_FAIL_ON=none
+              fi ;;
+          esac
+          # Xygeni Managed CI scan step, the same on every CI system (#2202). Each platform pipeline sets the variables
+          # below, inlines this script and may also report $OUTCOME its own way before exiting with $EXIT_CODE:
+          #   XYGENI_PULL_REQUEST  true on a pull request build
+          #   XYGENI_SCANNERS      scanner --run names, comma-separated
+          #   XYGENI_FAIL_ON       critical, high or none: pull requests fail from this severity; guardrails: they fail when
+          #                        a guardrail assigned to the project in Xygeni fails (--audit-project)
+          #   XYGENI_INCREMENTAL   true: pull requests scan only the changed files
+          #   XYGENI_PULL_REQUEST_SOURCE  source branch of the pull request (refs/heads/...): Xygeni's own setup pull request
+          #                        (xygeni-managed-ci-setup-*, changing only XYGENI_PIPELINE_PATH) is validated report-only
+          #   XYGENI_BUILD_REF     ref the CI checked out: the report-only case needs the SCM's merge commit (Azure: refs/pull/N/merge)
+          #   XYGENI_PIPELINE_PATH path of the Managed CI pipeline file in the repository (default pipelines/xygeni-managed-ci.yml)
+          #   XYGENI_SOURCE_DIR    checked out repository
+          #   XYGENI_MANAGED_CI_*  run id, url, trigger and pull request: the scanner uploads the outcome with the reports,
+          #                        which is what Xygeni shows as "Last scan" on every CI system
+          # A pull request without blocking gets the findings as one comment, posted by the scanner (--pr-comment) with the
+          # CI system's own token.
+          # Backticks for command substitution, never the dollar-parenthesis form: Azure expands that as a pipeline variable.
+          #
+          # Install the Xygeni scanner, verifying its published SHA-256 checksum first.
+          # If the checksum does not match, nothing is installed and the job stops.
+          XY=`mktemp -d` &&
+          curl -sSfL --retry 3 -o "$XY/get-xygeni.sh" https://get.xygeni.io/latest/scanner/get-xygeni.sh &&
+          curl -sSfL --retry 3 -o "$XY/get-xygeni.sh.sha256" https://raw.githubusercontent.com/xygeni/xygeni/main/checksum/latest/get-xygeni.sh.sha256 &&
+          echo "`cat $XY/get-xygeni.sh.sha256`  $XY/get-xygeni.sh" | sha256sum -c - &&
+          sh "$XY/get-xygeni.sh" &&
+          rm -rf "$XY" || { echo "ERROR: Xygeni scanner installation failed: download error, or the installer did not match its published checksum. Nothing was installed or run."; exit 1; }
+          # Pull requests can block the merge (failing check) and scan only the changed files.
+          # Without PR blocking, a pull request gets the findings as a comment instead.
+          BLOCKING=false
+          FAIL_OPTION=""
+          INCREMENTAL_OPTION=""
+          COMMENT_OPTION=""
+          # Scanners that know --pr-comment (the Managed CI release) also name the branch of an incremental scan from the CI
+          # instead of git, which answers "HEAD" on a CI checkout. No pipe into grep -q here: CI systems run this with pipefail
+          # (Azure: bash -e -o pipefail), and grep -q leaving early kills the help with SIGPIPE.
+          MANAGED_CI_SCANNER=false
+          XYGENI_HELP=`$HOME/.xygeni/xygeni scan --help 2>/dev/null || true`
+          case "$XYGENI_HELP" in *--pr-comment*) MANAGED_CI_SCANNER=true ;; esac
+          case "$XYGENI_INCREMENTAL" in [Tt]rue) INCREMENTAL=true ;; *) INCREMENTAL=false ;; esac
+          if [ "$XYGENI_PULL_REQUEST" = "true" ]; then
+            # the severity reaches the command line as one of the values Xygeni writes, never as free text
+            case "$XYGENI_FAIL_ON" in
+              critical|high) BLOCKING=true; FAIL_OPTION="--fail-on $XYGENI_FAIL_ON" ;;
+              guardrails) BLOCKING=true; FAIL_OPTION="--audit-project" ;;
+              none|"") ;;
+              *) echo "ERROR: XYGENI_FAIL_ON must be critical, high, guardrails or none (got '$XYGENI_FAIL_ON')"; exit 1 ;;
+            esac
+            # Xygeni's own setup pull request (branch xygeni-managed-ci-setup-*, changing only the Managed CI pipeline file,
+            # which the required-reviewers policy guards) is validated in report-only mode: the gate it introduces must not
+            # block its own merge on a repository that already has findings. A pull request changing anything else keeps the
+            # gate, whatever its branch is called. The diff is the whole pull request against its target: the CI builds the
+            # merge commit the SCM made (Azure: refs/pull/N/merge; checked out with fetch depth 2, so both parents are there),
+            # never the branch head, where the last commit alone could hide code pushed before it. When any of that cannot be
+            # verified, the gate stays.
+            if [ "$BLOCKING" = "true" ]; then
+              case "$XYGENI_PULL_REQUEST_SOURCE" in
+                refs/heads/xygeni-managed-ci-setup-*|xygeni-managed-ci-setup-*)
+                  MERGE_COMMIT=false
+                  case "$XYGENI_BUILD_REF" in refs/pull/*/merge) if git -C "$XYGENI_SOURCE_DIR" rev-parse --verify -q HEAD^2 >/dev/null 2>&1; then MERGE_COMMIT=true; fi ;; esac
+                  CHANGED=""
+                  if [ "$MERGE_COMMIT" = "true" ]; then CHANGED=`git -C "$XYGENI_SOURCE_DIR" diff --name-only HEAD^1 HEAD 2>/dev/null || true`; fi
+                  if [ -n "$CHANGED" ] && [ "$CHANGED" = "${XYGENI_PIPELINE_PATH:-pipelines/xygeni-managed-ci.yml}" ]; then
+                    echo "Xygeni Managed CI setup pull request: only the pipeline file changes, so this validation is report-only (the gate applies once it is merged)"
+                    BLOCKING=false; FAIL_OPTION=""
+                  fi ;;
+              esac
+            fi
+            if [ "$INCREMENTAL" = "true" ]; then INCREMENTAL_OPTION="--incremental"; fi
+            # an older scanner just scans: no comment, never a failed run
+            if [ "$BLOCKING" = "false" ] && [ "$MANAGED_CI_SCANNER" = "true" ]; then COMMENT_OPTION="--pr-comment"; fi
+          elif [ "$INCREMENTAL" = "true" ] && [ "$MANAGED_CI_SCANNER" = "true" ]; then
+            # the default branch scanned incrementally too: the scanner keeps a branch's baseline only from an incremental
+            # scan, and pull requests read the default branch's one
+            INCREMENTAL_OPTION="--incremental"
+          fi
+          # the build's access token is only for the pull request comment: the scan never sees it otherwise
+          if [ -z "$COMMENT_OPTION" ]; then unset SYSTEM_ACCESSTOKEN; fi
+          set +e
+          $HOME/.xygeni/xygeni scan -d "$XYGENI_SOURCE_DIR" --run="$XYGENI_SCANNERS" $FAIL_OPTION $INCREMENTAL_OPTION $COMMENT_OPTION
+          EXIT_CODE=$?
+          # Outcome Xygeni shows as "Last scan": exit code 128+ = issues found, which only fails the run with PR blocking on;
+          # 1..127 = the scan itself failed.
+          if [ $EXIT_CODE -ge 128 ] && [ "$BLOCKING" = "true" ]; then OUTCOME=blocked
+          elif [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -ge 128 ]; then OUTCOME=passed; EXIT_CODE=0
+          else OUTCOME=failed
+          fi
+          exit $EXIT_CODE
